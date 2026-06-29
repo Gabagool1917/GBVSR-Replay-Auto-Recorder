@@ -61,3 +61,18 @@ def output_dir() -> Path:
     d = app_root() / "output"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def overlay_path() -> Path:
+    """Path to the default score overlay PNG."""
+    return resource_path("assets", "overlay", "default_overlay.png")
+
+
+def font_path() -> Path:
+    """Path to the bundled bold font used for overlay text."""
+    return resource_path("assets", "fonts", "DejaVuSans-Bold.ttf")
+
+
+def icon_path() -> Path:
+    """Path to the app icon PNG (used for the window/taskbar icon at runtime)."""
+    return resource_path("assets", "icon", "icon.png")

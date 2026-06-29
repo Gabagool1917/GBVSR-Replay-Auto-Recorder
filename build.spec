@@ -34,15 +34,29 @@ imageio_ffmpeg and cv2 that handle this for us. If you ever see a
 "no ffmpeg exe could be found" or OpenCV DLL error from the built .exe,
 that's the first thing to check (`pip show pyinstaller-hooks-contrib`).
 """
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 hiddenimports = []
 hiddenimports += collect_submodules("moviepy")
 hiddenimports += collect_submodules("proglog")
 hiddenimports += ["pyautogui", "pydirectinput", "keyboard", "cv2"]
 
-datas = [
+# moviepy and imageio use importlib.metadata at runtime to find their own
+# version strings. PyInstaller strips .dist-info directories by default,
+# which causes a PackageNotFoundError on first import. copy_metadata()
+# bundles just the metadata (not the full package) so those lookups work.
+datas = []
+for pkg in ("imageio", "imageio-ffmpeg", "moviepy", "proglog"):
+    try:
+        datas += copy_metadata(pkg)
+    except Exception:
+        pass  # package not installed in this build env — skip silently
+
+datas += [
     ("assets/profiles", "assets/profiles"),
+    ("assets/overlay",  "assets/overlay"),
+    ("assets/fonts",    "assets/fonts"),
+    ("assets/icon",     "assets/icon"),
 ]
 
 a = Analysis(
@@ -79,5 +93,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon="assets/icon.ico",  # add an .ico here if you want a custom taskbar icon
+    icon="assets/icon/icon.ico",
 )

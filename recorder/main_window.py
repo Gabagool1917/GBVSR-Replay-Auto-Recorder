@@ -1,8 +1,10 @@
 """The main application window."""
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,9 +23,11 @@ from PySide6.QtWidgets import (
 )
 
 from .automation_worker import PLATFORM_SUPPORTED, AutomationWorker
-from .paths import temp_dir
+from .game_results_dialog import GameResultsDialog, SetInfo
+from .paths import icon_path, temp_dir
 from .profiles import PROFILES, best_matching_profile, detect_screen_resolution
 from .render_worker import RenderWorker
+from . import theme
 from .widgets import CollapsibleSection, LogPanel, StatusBadge, make_card
 
 DEFAULT_GAMES = 7
@@ -43,6 +47,11 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._populate_resolution_profiles()
         self._refresh_recordings_path()
+
+        # App icon (title bar + taskbar)
+        icon_file = icon_path()
+        if icon_file.exists():
+            self.setWindowIcon(QIcon(str(icon_file)))
 
         if not PLATFORM_SUPPORTED:
             self._log(
@@ -70,6 +79,7 @@ class MainWindow(QMainWindow):
         root.addWidget(subtitle)
 
         root.addWidget(self._build_setup_card())
+        root.addWidget(self._build_preflight_card())
 
         controls_row = QHBoxLayout()
         self.start_button = QPushButton("Start")
@@ -103,6 +113,45 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._build_log_section())
         root.addStretch(1)
+
+    def _build_preflight_card(self) -> QFrame:
+        frame, layout = make_card()
+        layout.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        dot = QLabel("⚠")
+        dot.setStyleSheet(f"color: {theme.STATUS_COLORS['loading']}; font-size: 15px;")
+        heading = QLabel("Before you start")
+        heading.setStyleSheet("font-weight: 600; font-size: 13px;")
+        header_row.addWidget(dot)
+        header_row.addWidget(heading)
+        header_row.addStretch(1)
+        layout.addLayout(header_row)
+
+        items = [
+            ("OBS keybinds", "Start Recording = , (comma) · Stop Recording = . (period)"),
+            ("Controllers", "Unplug all controllers and peripherals — the game must receive keyboard input"),
+            ("Replay selection", "In Replays, hover over the LAST game in your set before pressing Start"),
+        ]
+        for title, detail in items:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.setContentsMargins(4, 0, 0, 0)
+
+            bullet = QLabel("›")
+            bullet.setStyleSheet(f"color: {theme.ACCENT}; font-size: 14px; font-weight: 700;")
+            bullet.setFixedWidth(12)
+
+            text = QLabel(f"<b>{title}:</b> {detail}")
+            text.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: 12px;")
+            text.setWordWrap(True)
+
+            row.addWidget(bullet, 0)
+            row.addWidget(text, 1)
+            layout.addLayout(row)
+
+        return frame
 
     def _build_setup_card(self) -> QFrame:
         frame, layout = make_card("Setup")
@@ -312,38 +361,118 @@ class MainWindow(QMainWindow):
         self.recording_time_label.setVisible(False)
         self.automation_worker = None
         if success and self.auto_combine_check.isChecked():
-            self._start_render()
+            self._on_combine_clicked()
 
     # -------------------------------------------------------------- render
     def _on_combine_clicked(self) -> None:
-        self._start_render()
+        from .render_worker import VIDEO_EXTENSIONS
+        clips = sorted(
+            [p for p in temp_dir().iterdir()
+             if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+        ) if temp_dir().is_dir() else []
 
-    def _start_render(self) -> None:
+        if not clips:
+            QMessageBox.warning(
+                self,
+                "No recordings found",
+                f"No video files found in:\n{temp_dir()}\n\n"
+                "Make sure OBS's recording output path points to that folder.",
+            )
+            return
+
+        # Rename raw OBS files to Game 1, Game 2, etc. before showing dialog
+        try:
+            clips = self._rename_to_game_numbers(clips)
+            self._log("info", f"Recordings renamed: {', '.join(c.name for c in clips)}")
+        except Exception as exc:  # noqa: BLE001
+            self._log("warn", f"Could not rename recordings: {exc} — using original names.")
+
+        dialog = GameResultsDialog(clips, parent=self)
+        if dialog.exec() != GameResultsDialog.DialogCode.Accepted:
+            return
+
+        self._start_render(dialog.set_info())
+
+    @staticmethod
+    def _rename_to_game_numbers(clips: list) -> list:
+        """Rename sorted clip files to 'Game 1.ext', 'Game 2.ext', etc.
+
+        Uses a two-pass rename (temp names first) to safely handle any
+        collisions when some files are already named 'Game N'.
+        Returns the list of new Path objects.
+        """
+        from pathlib import Path
+
+        already_pattern = re.compile(r'^Game \d+\.\w+$', re.IGNORECASE)
+        if all(already_pattern.match(c.name) for c in clips):
+            return clips  # already correctly named, nothing to do
+
+        # Pass 1: rename to temp names to avoid collisions mid-rename
+        temp_clips = []
+        for i, clip in enumerate(clips):
+            temp = clip.parent / f"_gbvsr_renaming_{i}{clip.suffix}"
+            clip.rename(temp)
+            temp_clips.append(temp)
+
+        # Pass 2: rename from temp to final Game N names
+        final_clips = []
+        for i, clip in enumerate(temp_clips, start=1):
+            final = clip.parent / f"Game {i}{clip.suffix}"
+            clip.rename(final)
+            final_clips.append(final)
+
+        return final_clips
+
+    def _start_render(self, set_info: SetInfo | None = None) -> None:
         if self.render_worker is not None and self.render_worker.isRunning():
             return
-        self.render_worker = RenderWorker()
+        self.render_worker = RenderWorker(set_info=set_info)
         self.render_worker.progress.connect(self._on_render_progress)
         self.render_worker.log_message.connect(self._log)
         self.render_worker.finished_render.connect(self._on_render_finished)
+        # Clean up the QThread object via Qt's own scheduler once run() returns.
+        # Dropping a Python reference to a live QThread can crash on Windows;
+        # deleteLater() queues the deletion safely after the thread fully exits.
+        self.render_worker.finished.connect(self.render_worker.deleteLater)
+        self.render_worker.finished.connect(self._on_render_worker_finished)
 
         self.start_button.setEnabled(False)
         self.combine_button.setEnabled(False)
         self.render_progress.setVisible(True)
         self.render_progress.setValue(0)
+
+        # Auto-open the log so encoding progress is visible without extra clicks
+        if not self.log_section._expanded:
+            self.log_section.toggle()
+
         self.render_worker.start()
+
+    def _on_render_worker_finished(self) -> None:
+        """Called when the QThread itself has exited — safe point to clear the ref."""
+        self.render_worker = None
 
     def _on_render_progress(self, fraction: float) -> None:
         self.render_progress.setValue(int(fraction * 100))
+        # Keep the window title updated so progress is visible even when minimised
+        pct = int(fraction * 100)
+        self.setWindowTitle(f"GBVSR Auto Recorder — Encoding {pct}%")
 
     def _on_render_finished(self, success: bool, path_or_error: str) -> None:
+        self.setWindowTitle("GBVSR Auto Recorder")
         self.render_progress.setVisible(False)
         self.start_button.setEnabled(PLATFORM_SUPPORTED)
         self.combine_button.setEnabled(True)
         if success:
             self.status_badge.set_status("success", "Combined video ready", path_or_error)
+            self._log("info", "✓ Encoding complete.")
+            # Flash the taskbar button so the user knows it's done even if
+            # they've switched windows. Flashes until they click back in.
+            QApplication.alert(self, 0)
         else:
             self.status_badge.set_status("error", "Combine failed", path_or_error)
-        self.render_worker = None
+            self._log("error", "✗ Encoding failed.")
+        # Note: self.render_worker = None is handled by _on_render_worker_finished
+        # (connected to QThread.finished) to avoid dropping the ref prematurely.
 
     # --------------------------------------------------------------- misc
     def _populate_resolution_profiles(self) -> None:

@@ -19,6 +19,12 @@ def main() -> int:
     app.setOrganizationName("GBVSR Auto Recorder")
     app.setStyleSheet(STYLESHEET)
 
+    from recorder.paths import icon_path
+    from PySide6.QtGui import QIcon
+    icon_file = icon_path()
+    if icon_file.exists():
+        app.setWindowIcon(QIcon(str(icon_file)))
+
     window = MainWindow()
     window.show()
 
